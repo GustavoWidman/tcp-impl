@@ -12,30 +12,58 @@ const MACOS_AF_INET_PREFIX: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
 
 const DEFAULT_MTU: usize = 1500;
 
+/// Returns a companion IP to use as the TUN interface's local address.
+///
+/// `ip` becomes the peer/destination address so the kernel does not own it.
+/// We simply increment (or decrement if at 255) the last octet.
+fn companion_ip(ip: Ipv4Addr) -> Ipv4Addr {
+    let [a, b, c, d] = ip.octets();
+    let d2 = if d < 255 { d + 1 } else { d - 1 };
+    Ipv4Addr::new(a, b, c, d2)
+}
+
 pub struct TunDevice {
     inner: tun::platform::Device,
     mtu: usize,
 }
 
 impl TunDevice {
-    /// Creates a utun device, assigns the given IP, brings it up.
-    /// Prints the utun interface name so the user knows which interface to use.
+    /// Creates a utun device configured as a point-to-point interface and brings it up.
+    ///
+    /// On macOS, utun interfaces are always point-to-point. If `tun_ip` were assigned
+    /// as the LOCAL address, the kernel would own that IP and answer TCP SYNs with RST
+    /// before userspace ever sees them. Instead we configure:
+    ///
+    ///   local  = companion_ip(tun_ip)   ← kernel-owned, used as the source by nc
+    ///   peer   = tun_ip                 ← NOT kernel-owned; routed through the TUN fd
+    ///
+    /// Traffic destined for `tun_ip` is now delivered to our fd, not answered by the
+    /// kernel stack.
     pub fn new(tun_ip: &str) -> std::io::Result<Self> {
-        let ip: Ipv4Addr = tun_ip.parse().map_err(|e| {
+        let peer: Ipv4Addr = tun_ip.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}"))
         })?;
 
+        // Use a companion IP as the interface's local address so `peer` remains
+        // unowned by the kernel and routable through the TUN fd.
+        let local = companion_ip(peer);
+
         let mut config = tun::Configuration::default();
         config
-            .address(ip)
-            .netmask((255, 255, 255, 0))
+            .address(local)
+            .destination(peer)
             .mtu(DEFAULT_MTU as i32)
             .up();
 
         let device = tun::create(&config)
             .map_err(|e| std::io::Error::other(format!("tun create failed: {e}")))?;
 
-        log::info!("TUN device up: {:?}", device.name());
+        log::info!(
+            "TUN device up: {:?} (local={} peer={})",
+            device.name(),
+            local,
+            peer,
+        );
 
         Ok(Self {
             inner: device,
@@ -134,6 +162,27 @@ mod tests {
         assert_eq!(parsed.header.src_addr, [10, 0, 0, 1]);
         assert_eq!(parsed.header.dst_addr, [10, 0, 0, 2]);
         assert_eq!(parsed.header.protocol, 6);
+    }
+
+    #[test]
+    fn test_companion_ip() {
+        // Normal case: last octet < 255 → increments
+        assert_eq!(
+            companion_ip(Ipv4Addr::new(10, 0, 0, 1)),
+            Ipv4Addr::new(10, 0, 0, 2)
+        );
+        assert_eq!(
+            companion_ip(Ipv4Addr::new(192, 168, 1, 100)),
+            Ipv4Addr::new(192, 168, 1, 101)
+        );
+        // Edge case: last octet == 255 → decrements
+        assert_eq!(
+            companion_ip(Ipv4Addr::new(10, 0, 0, 255)),
+            Ipv4Addr::new(10, 0, 0, 254)
+        );
+        // Companion is always different from the input
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        assert_ne!(companion_ip(ip), ip);
     }
 
     /// Test the write frame construction: verify the output starts with [0,0,0,2]
