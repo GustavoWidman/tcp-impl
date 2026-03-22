@@ -23,9 +23,9 @@ impl TunDevice {
     /// Creates a utun device, assigns the given IP, brings it up.
     /// Prints the utun interface name so the user knows which interface to use.
     pub fn new(tun_ip: &str) -> std::io::Result<Self> {
-        let ip: Ipv4Addr = tun_ip
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}")))?;
+        let ip: Ipv4Addr = tun_ip.parse().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}"))
+        })?;
 
         let mut config = tun::Configuration::default();
         config

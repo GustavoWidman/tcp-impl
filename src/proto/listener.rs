@@ -16,15 +16,30 @@ pub struct TcpListener {
 
 impl TcpListener {
     pub fn new(tun: TunDevice, local_ip: Ipv4Addr, port: u16) -> Self {
-        Self { tun, local_ip, port }
+        Self {
+            tun,
+            local_ip,
+            port,
+        }
+    }
+
+    /// Consume the listener and return the underlying TUN device.
+    pub fn into_tun(self) -> TunDevice {
+        self.tun
     }
 
     pub fn accept(&mut self) -> std::io::Result<TcpConnection> {
         log::info!("listening on {}:{}", self.local_ip, self.port);
 
-        let local_addr: SocketAddrV4 = format!("{}:{}", self.local_ip, self.port)
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid addr: {e}")))?;
+        let local_addr: SocketAddrV4 =
+            format!("{}:{}", self.local_ip, self.port)
+                .parse()
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid addr: {e}"),
+                    )
+                })?;
 
         let mut conn = TcpConnection::new_listener(local_addr);
 
@@ -92,7 +107,8 @@ impl TcpListener {
                         }
                         let segment = TcpSegment::new(hdr, payload)
                             .with_checksum(&self.local_ip, &remote_ip)?;
-                        self.tun.write_ip_packet(self.local_ip, remote_ip, &segment)?;
+                        self.tun
+                            .write_ip_packet(self.local_ip, remote_ip, &segment)?;
                     }
                     TcpAction::Close | TcpAction::Reset => {
                         return Err(std::io::Error::new(
@@ -154,6 +170,9 @@ mod tests {
         };
         let actions2 = conn.handle(&ack_hdr, &[]);
         assert!(matches!(conn.state, TcpState::Established));
-        assert!(actions2.is_empty(), "no reply needed for the completing ACK");
+        assert!(
+            actions2.is_empty(),
+            "no reply needed for the completing ACK"
+        );
     }
 }

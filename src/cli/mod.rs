@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[derive(Parser, Debug)]
 #[command(name = "tcp-impl", about = "TCP over TUN implementation")]
@@ -15,16 +15,16 @@ pub struct Args {
 pub enum Command {
     /// Listen for incoming TCP connections on TUN
     Listener {
-        #[arg(short, long)]
-        addr: SocketAddrV4,
-        #[arg(short, long)]
+        #[arg(long, default_value = "10.0.0.1")]
+        tun_ip: Ipv4Addr,
+        #[arg(short, long, default_value = "4444")]
         port: u16,
     },
     /// Initiate a TCP connection via TUN
     Sender {
+        #[arg(long, default_value = "10.0.0.2")]
+        tun_ip: Ipv4Addr,
         #[arg(short, long)]
-        bind: SocketAddrV4,
-        #[arg(short, long)]
-        addr: SocketAddrV4,
+        connect: SocketAddrV4,
     },
 }

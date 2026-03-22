@@ -190,7 +190,7 @@ impl TcpConnection {
 
     pub fn run(self, tun: TunDevice) -> std::io::Result<()> {
         use std::io::{BufRead, Write};
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::{mpsc, Arc, Mutex};
 
         let conn = Arc::new(Mutex::new(self));
         let tun = Arc::new(Mutex::new(tun));
@@ -231,9 +231,10 @@ impl TcpConnection {
                 let local_ip = *c.local_addr.ip();
                 let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
                 drop(c);
-                let segment = TcpSegment::new(hdr, payload)
-                    .with_checksum(&local_ip, &remote_ip)?;
-                tun.lock().unwrap().write_ip_packet(local_ip, remote_ip, &segment)?;
+                let segment = TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                tun.lock()
+                    .unwrap()
+                    .write_ip_packet(local_ip, remote_ip, &segment)?;
             }
 
             // Blocking TUN read
@@ -288,9 +289,11 @@ impl TcpConnection {
             for action in actions {
                 match action {
                     TcpAction::Send(hdr, payload) => {
-                        let segment = TcpSegment::new(hdr, payload)
-                            .with_checksum(&local_ip, &remote_ip)?;
-                        tun.lock().unwrap().write_ip_packet(local_ip, remote_ip, &segment)?;
+                        let segment =
+                            TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                        tun.lock()
+                            .unwrap()
+                            .write_ip_packet(local_ip, remote_ip, &segment)?;
                     }
                     TcpAction::Deliver(data) => {
                         let mut out = stdout.lock();
@@ -317,23 +320,47 @@ mod tests {
     use super::*;
 
     fn syn_seg(seq: u32) -> TcpHeader {
-        TcpHeader { syn: true, seq_num: seq, ..Default::default() }
+        TcpHeader {
+            syn: true,
+            seq_num: seq,
+            ..Default::default()
+        }
     }
 
     fn ack_seg(seq: u32, ack_num: u32) -> TcpHeader {
-        TcpHeader { ack: true, seq_num: seq, ack_num, ..Default::default() }
+        TcpHeader {
+            ack: true,
+            seq_num: seq,
+            ack_num,
+            ..Default::default()
+        }
     }
 
     fn psh_ack_seg(seq: u32, ack_num: u32) -> TcpHeader {
-        TcpHeader { psh: true, ack: true, seq_num: seq, ack_num, ..Default::default() }
+        TcpHeader {
+            psh: true,
+            ack: true,
+            seq_num: seq,
+            ack_num,
+            ..Default::default()
+        }
     }
 
     fn fin_ack_seg(seq: u32, ack_num: u32) -> TcpHeader {
-        TcpHeader { fin: true, ack: true, seq_num: seq, ack_num, ..Default::default() }
+        TcpHeader {
+            fin: true,
+            ack: true,
+            seq_num: seq,
+            ack_num,
+            ..Default::default()
+        }
     }
 
     fn rst_seg() -> TcpHeader {
-        TcpHeader { rst: true, ..Default::default() }
+        TcpHeader {
+            rst: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -343,7 +370,9 @@ mod tests {
         let actions = conn.handle(&syn, &[]);
         assert_eq!(conn.state, TcpState::SynReceived);
         assert_eq!(conn.recv_seq, 1001);
-        let has_syn_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.syn && h.ack));
+        let has_syn_ack = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.syn && h.ack));
         assert!(has_syn_ack, "should send SYN-ACK");
     }
 
@@ -370,8 +399,12 @@ mod tests {
         let psh = psh_ack_seg(1001, conn.send_seq);
         let actions = conn.handle(&psh, data);
 
-        let has_deliver = actions.iter().any(|a| matches!(a, TcpAction::Deliver(d) if d == b"hello"));
-        let has_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
+        let has_deliver = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Deliver(d) if d == b"hello"));
+        let has_ack = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
         assert!(has_deliver, "should deliver data to application");
         assert!(has_ack, "should send ACK");
         assert_eq!(conn.recv_seq, 1001 + 5);
@@ -388,7 +421,9 @@ mod tests {
         let fin = fin_ack_seg(1001, conn.send_seq);
         let actions = conn.handle(&fin, &[]);
         assert_eq!(conn.state, TcpState::CloseWait);
-        let has_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack));
+        let has_ack = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack));
         assert!(has_ack);
 
         // We initiate our close
@@ -472,9 +507,17 @@ mod tests {
             ..Default::default()
         };
         let actions = conn.handle(&hdr, b"world");
-        assert_eq!(conn.recv_seq, initial_recv_seq + 5, "recv_seq should advance by payload len");
-        let has_deliver = actions.iter().any(|a| matches!(a, TcpAction::Deliver(d) if d == b"world"));
-        let has_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
+        assert_eq!(
+            conn.recv_seq,
+            initial_recv_seq + 5,
+            "recv_seq should advance by payload len"
+        );
+        let has_deliver = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Deliver(d) if d == b"world"));
+        let has_ack = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
         assert!(has_deliver, "should deliver data");
         assert!(has_ack, "should send ACK");
     }
@@ -493,7 +536,9 @@ mod tests {
         let fin = fin_ack_seg(conn.recv_seq, 999);
         let actions = conn.handle(&fin, &[]);
         assert_eq!(conn.state, TcpState::Closing);
-        assert!(actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack)));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack)));
 
         // Remote ACKs our FIN → Closed
         let ack = ack_seg(conn.recv_seq, conn.send_seq);
@@ -506,7 +551,10 @@ mod tests {
     fn test_send_data_not_established() {
         let mut conn = TcpConnection::new_listener("10.0.0.1:4444".parse().unwrap());
         let actions = conn.send_data(b"hello");
-        assert!(actions.is_empty(), "send_data should do nothing when not Established");
+        assert!(
+            actions.is_empty(),
+            "send_data should do nothing when not Established"
+        );
     }
 
     #[test]
