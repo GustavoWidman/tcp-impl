@@ -9,8 +9,6 @@ use crate::proto::packet::{Ipv4Packet, TcpSegment};
 
 /// macOS utun 4-byte AF_INET packet family prefix (flags=0, protocol=AF_INET=2 in network byte order)
 const MACOS_AF_INET_PREFIX: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
-/// macOS utun 4-byte AF_INET6 packet family prefix
-const MACOS_AF_INET6_PREFIX: [u8; 4] = [0x00, 0x00, 0x00, 0x1e];
 
 const DEFAULT_MTU: usize = 1500;
 
@@ -37,7 +35,6 @@ impl TunDevice {
         let device = tun::create(&config)
             .map_err(|e| std::io::Error::other(format!("tun create failed: {e}")))?;
 
-        // Print the interface name so the user knows the utun device
         log::info!("TUN device up: {:?}", device.name());
 
         Ok(Self {
@@ -57,10 +54,7 @@ impl TunDevice {
             return Ok(None);
         }
 
-        // Check the 4-byte macOS prefix
-        let prefix = &buf[..4];
-        if prefix != MACOS_AF_INET_PREFIX {
-            // Not IPv4 (could be IPv6 or other) — skip
+        if buf[..4] != MACOS_AF_INET_PREFIX {
             return Ok(None);
         }
 
@@ -140,13 +134,6 @@ mod tests {
         assert_eq!(parsed.header.src_addr, [10, 0, 0, 1]);
         assert_eq!(parsed.header.dst_addr, [10, 0, 0, 2]);
         assert_eq!(parsed.header.protocol, 6);
-    }
-
-    /// Test that IPv6 frames (wrong prefix) are skipped.
-    #[test]
-    fn test_skip_ipv6_prefix() {
-        let prefix = &MACOS_AF_INET6_PREFIX;
-        assert_ne!(prefix, &MACOS_AF_INET_PREFIX);
     }
 
     /// Test the write frame construction: verify the output starts with [0,0,0,2]

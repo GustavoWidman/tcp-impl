@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod cli;
 mod common;
 mod proto;
@@ -19,7 +17,11 @@ fn main() -> std::io::Result<()> {
 
             let mut listener = proto::listener::TcpListener::new(tun, tun_ip, port);
             let conn = listener.accept()?;
-            log::info!("connection established with {}", conn.remote_addr.unwrap());
+            log::info!(
+                "connection established with {}",
+                conn.remote_addr
+                    .expect("accept guarantees remote_addr is set")
+            );
             let tun = listener.into_tun();
             conn.run(tun)?;
             log::info!("connection closed");

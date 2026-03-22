@@ -10,6 +10,7 @@ use crate::proto::tun::TunDevice;
 pub enum TcpState {
     Closed,
     Listen,
+    #[allow(dead_code)] // active open (sender mode) not yet implemented
     SynSent,
     SynReceived,
     Established,
@@ -18,6 +19,7 @@ pub enum TcpState {
     CloseWait,
     Closing,
     LastAck,
+    #[allow(dead_code)] // 2MSL timer not implemented; FinWait2 goes directly to Closed
     TimeWait,
 }
 
@@ -26,6 +28,7 @@ pub enum TcpAction {
     Send(TcpHeader, Vec<u8>),
     Deliver(Vec<u8>),
     Close,
+    #[allow(dead_code)] // RST sending not yet implemented; RST receipt transitions to Close
     Reset,
 }
 
@@ -35,8 +38,6 @@ pub struct TcpConnection {
     pub remote_addr: Option<SocketAddrV4>,
     pub send_seq: u32,
     pub recv_seq: u32,
-    pub send_window: u16,
-    pub recv_window: u16,
 }
 
 impl TcpConnection {
@@ -55,8 +56,6 @@ impl TcpConnection {
             remote_addr: None,
             send_seq: 0,
             recv_seq: 0,
-            send_window: 65535,
-            recv_window: 65535,
         }
     }
 
@@ -122,7 +121,7 @@ impl TcpConnection {
             // Rule 7: FinWait2 + FIN
             TcpState::FinWait2 if seg.fin => {
                 self.recv_seq = seg.seq_num.wrapping_add(1);
-                // Transition through TimeWait to Closed
+                // Skip TimeWait: no 2MSL timer in this impl
                 self.state = TcpState::Closed;
                 let ack_hdr = TcpHeader::ack(local_port, remote_port, self.send_seq, self.recv_seq);
                 vec![TcpAction::Send(ack_hdr, vec![]), TcpAction::Close]
@@ -207,13 +206,13 @@ impl TcpConnection {
                 let n = stdin.lock().read_line(&mut line).unwrap_or(0);
                 if n == 0 {
                     // EOF: initiate close
-                    let mut c = conn_send.lock().unwrap();
+                    let mut c = conn_send.lock().expect("mutex not poisoned");
                     if let Some(TcpAction::Send(hdr, payload)) = c.close() {
                         out_tx.send((hdr, payload)).ok();
                     }
                     break;
                 }
-                let mut c = conn_send.lock().unwrap();
+                let mut c = conn_send.lock().expect("mutex not poisoned");
                 for action in c.send_data(line.as_bytes()) {
                     if let TcpAction::Send(hdr, payload) = action {
                         out_tx.send((hdr, payload)).ok();
@@ -227,19 +226,19 @@ impl TcpConnection {
         loop {
             // Drain any queued outgoing segments from send thread
             while let Ok((hdr, payload)) = out_rx.try_recv() {
-                let c = conn.lock().unwrap();
+                let c = conn.lock().expect("mutex not poisoned");
                 let local_ip = *c.local_addr.ip();
                 let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
                 drop(c);
                 let segment = TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
                 tun.lock()
-                    .unwrap()
+                    .expect("mutex not poisoned")
                     .write_ip_packet(local_ip, remote_ip, &segment)?;
             }
 
             // Blocking TUN read
             let pkt = {
-                let mut t = tun.lock().unwrap();
+                let mut t = tun.lock().expect("mutex not poisoned");
                 t.read_ip_packet()?
             };
             let pkt = match pkt {
@@ -263,7 +262,7 @@ impl TcpConnection {
 
             // Filter: only packets from our established remote
             {
-                let c = conn.lock().unwrap();
+                let c = conn.lock().expect("mutex not poisoned");
                 if let Some(remote_addr) = c.remote_addr {
                     if *remote_addr.ip() != remote_ip || remote_addr.port() != seg_hdr.src_port {
                         continue;
@@ -271,7 +270,7 @@ impl TcpConnection {
                 }
             }
 
-            let hdr_len = (seg_hdr.data_offset as usize * 4).max(20);
+            let hdr_len = seg_hdr.header_len().max(20);
             let tcp_payload = if pkt.payload.len() > hdr_len {
                 pkt.payload[hdr_len..].to_vec()
             } else {
@@ -279,11 +278,14 @@ impl TcpConnection {
             };
 
             let local_ip = {
-                let c = conn.lock().unwrap();
+                let c = conn.lock().expect("mutex not poisoned");
                 *c.local_addr.ip()
             };
 
-            let actions = conn.lock().unwrap().handle(&seg_hdr, &tcp_payload);
+            let actions = conn
+                .lock()
+                .expect("mutex not poisoned")
+                .handle(&seg_hdr, &tcp_payload);
 
             let mut should_close = false;
             for action in actions {
@@ -292,7 +294,7 @@ impl TcpConnection {
                         let segment =
                             TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
                         tun.lock()
-                            .unwrap()
+                            .expect("mutex not poisoned")
                             .write_ip_packet(local_ip, remote_ip, &segment)?;
                     }
                     TcpAction::Deliver(data) => {

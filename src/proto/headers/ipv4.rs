@@ -15,6 +15,7 @@ pub struct Ipv4Header {
     pub fragment_offset: u16,
     pub ttl: u8,
     pub protocol: u8,
+    #[allow(dead_code)] // parsed from wire but not validated in this impl
     pub checksum: u16,
     pub src_addr: [u8; 4],
     pub dst_addr: [u8; 4],

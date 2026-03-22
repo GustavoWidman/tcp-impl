@@ -52,6 +52,7 @@ impl TcpHeader {
         }
     }
 
+    #[allow(dead_code)] // used in tests; would be used by sender mode
     pub fn syn(src_port: u16, dst_port: u16, seq: u32) -> Self {
         Self {
             syn: true,
