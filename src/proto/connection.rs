@@ -111,6 +111,14 @@ impl TcpConnection {
                 vec![]
             }
 
+            // Rule 6b: FinWait1 + FIN (simultaneous close — their FIN arrives before our ACK)
+            TcpState::FinWait1 if seg.fin => {
+                self.recv_seq = seg.seq_num.wrapping_add(1);
+                self.state = TcpState::Closing;
+                let ack_hdr = TcpHeader::ack(local_port, remote_port, self.send_seq, self.recv_seq);
+                vec![TcpAction::Send(ack_hdr, vec![])]
+            }
+
             // Rule 7: FinWait2 + FIN
             TcpState::FinWait2 if seg.fin => {
                 self.recv_seq = seg.seq_num.wrapping_add(1);
@@ -122,6 +130,12 @@ impl TcpConnection {
 
             // Rule 8: LastAck + ACK (ack_num matches send_seq)
             TcpState::LastAck if seg.ack && seg.ack_num == self.send_seq => {
+                self.state = TcpState::Closed;
+                vec![TcpAction::Close]
+            }
+
+            // Rule 9: Closing + ACK → TimeWait → Closed (immediate, no 2*MSL)
+            TcpState::Closing if seg.ack && seg.ack_num == self.send_seq => {
                 self.state = TcpState::Closed;
                 vec![TcpAction::Close]
             }
@@ -463,6 +477,29 @@ mod tests {
         let has_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
         assert!(has_deliver, "should deliver data");
         assert!(has_ack, "should send ACK");
+    }
+
+    #[test]
+    fn test_simultaneous_close() {
+        let mut conn = established_conn();
+
+        // We initiate close → FinWait1
+        let close_action = conn.close().expect("close should return action");
+        assert_eq!(conn.state, TcpState::FinWait1);
+        assert!(matches!(close_action, TcpAction::Send(h, _) if h.fin));
+
+        // Remote sends FIN before ACKing ours → Closing
+        // ack_num = 999 does not match conn.send_seq (1001), so Rule 6 doesn't fire
+        let fin = fin_ack_seg(conn.recv_seq, 999);
+        let actions = conn.handle(&fin, &[]);
+        assert_eq!(conn.state, TcpState::Closing);
+        assert!(actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack)));
+
+        // Remote ACKs our FIN → Closed
+        let ack = ack_seg(conn.recv_seq, conn.send_seq);
+        let actions = conn.handle(&ack, &[]);
+        assert_eq!(conn.state, TcpState::Closed);
+        assert!(actions.iter().any(|a| matches!(a, TcpAction::Close)));
     }
 
     #[test]
