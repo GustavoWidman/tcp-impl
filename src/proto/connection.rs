@@ -1,7 +1,10 @@
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::common::traits::FromBytes;
 use crate::proto::headers::tcp::TcpHeader;
+use crate::proto::packet::TcpSegment;
+use crate::proto::tun::TunDevice;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TcpState {
@@ -157,6 +160,142 @@ impl TcpConnection {
             _ => None,
         }
     }
+
+    pub fn send_data(&mut self, data: &[u8]) -> Vec<TcpAction> {
+        if self.state != TcpState::Established {
+            return vec![];
+        }
+        let src_port = self.local_addr.port();
+        let dst_port = self.remote_addr.map(|a| a.port()).unwrap_or(0);
+        let seq = self.send_seq;
+        let ack = self.recv_seq;
+        let hdr = TcpHeader::psh_ack(src_port, dst_port, seq, ack);
+        self.send_seq = self.send_seq.wrapping_add(data.len() as u32);
+        vec![TcpAction::Send(hdr, data.to_vec())]
+    }
+
+    pub fn run(self, tun: TunDevice) -> std::io::Result<()> {
+        use std::io::{BufRead, Write};
+        use std::sync::{Arc, Mutex, mpsc};
+
+        let conn = Arc::new(Mutex::new(self));
+        let tun = Arc::new(Mutex::new(tun));
+
+        let (out_tx, out_rx) = mpsc::channel::<(TcpHeader, Vec<u8>)>();
+
+        // Thread 2 (send): read stdin lines → call send_data → queue segments
+        let conn_send = Arc::clone(&conn);
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = stdin.lock().read_line(&mut line).unwrap_or(0);
+                if n == 0 {
+                    // EOF: initiate close
+                    let mut c = conn_send.lock().unwrap();
+                    if let Some(TcpAction::Send(hdr, payload)) = c.close() {
+                        out_tx.send((hdr, payload)).ok();
+                    }
+                    break;
+                }
+                let mut c = conn_send.lock().unwrap();
+                for action in c.send_data(line.as_bytes()) {
+                    if let TcpAction::Send(hdr, payload) = action {
+                        out_tx.send((hdr, payload)).ok();
+                    }
+                }
+            }
+        });
+
+        // Thread 1 (recv): main thread owns TUN read; drains outgoing queue between reads
+        let stdout = std::io::stdout();
+        loop {
+            // Drain any queued outgoing segments from send thread
+            while let Ok((hdr, payload)) = out_rx.try_recv() {
+                let c = conn.lock().unwrap();
+                let local_ip = *c.local_addr.ip();
+                let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
+                drop(c);
+                let segment = TcpSegment::new(hdr, payload)
+                    .with_checksum(&local_ip, &remote_ip)?;
+                tun.lock().unwrap().write_ip_packet(local_ip, remote_ip, &segment)?;
+            }
+
+            // Blocking TUN read
+            let pkt = {
+                let mut t = tun.lock().unwrap();
+                t.read_ip_packet()?
+            };
+            let pkt = match pkt {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if pkt.header.protocol != 6 {
+                continue;
+            }
+            if pkt.payload.len() < 20 {
+                continue;
+            }
+
+            let seg_hdr = match TcpHeader::from_bytes(&pkt.payload) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            let remote_ip = Ipv4Addr::from(pkt.header.src_addr);
+
+            // Filter: only packets from our established remote
+            {
+                let c = conn.lock().unwrap();
+                if let Some(remote_addr) = c.remote_addr {
+                    if *remote_addr.ip() != remote_ip || remote_addr.port() != seg_hdr.src_port {
+                        continue;
+                    }
+                }
+            }
+
+            let hdr_len = (seg_hdr.data_offset as usize * 4).max(20);
+            let tcp_payload = if pkt.payload.len() > hdr_len {
+                pkt.payload[hdr_len..].to_vec()
+            } else {
+                vec![]
+            };
+
+            let local_ip = {
+                let c = conn.lock().unwrap();
+                *c.local_addr.ip()
+            };
+
+            let actions = conn.lock().unwrap().handle(&seg_hdr, &tcp_payload);
+
+            let mut should_close = false;
+            for action in actions {
+                match action {
+                    TcpAction::Send(hdr, payload) => {
+                        let segment = TcpSegment::new(hdr, payload)
+                            .with_checksum(&local_ip, &remote_ip)?;
+                        tun.lock().unwrap().write_ip_packet(local_ip, remote_ip, &segment)?;
+                    }
+                    TcpAction::Deliver(data) => {
+                        let mut out = stdout.lock();
+                        out.write_all(&data)?;
+                        out.flush()?;
+                    }
+                    TcpAction::Close | TcpAction::Reset => {
+                        should_close = true;
+                    }
+                }
+            }
+
+            if should_close {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +415,61 @@ mod tests {
 
         // send_seq should not change when receiving data (only changes when we send)
         assert_eq!(conn.send_seq, send_seq_after_syn_ack);
+    }
+
+    fn established_conn() -> TcpConnection {
+        let mut conn = TcpConnection::new_listener("10.0.0.1:4444".parse().unwrap());
+        conn.remote_addr = Some("10.0.0.2:5555".parse().unwrap());
+        conn.state = TcpState::Established;
+        conn.send_seq = 1000;
+        conn.recv_seq = 2000;
+        conn
+    }
+
+    #[test]
+    fn test_send_data_advances_seq() {
+        let mut conn = established_conn();
+        let initial_seq = conn.send_seq;
+        let actions = conn.send_data(b"hello");
+        assert_eq!(conn.send_seq, initial_seq + 5);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            TcpAction::Send(hdr, payload) => {
+                assert!(hdr.psh, "should have PSH flag");
+                assert!(hdr.ack, "should have ACK flag");
+                assert_eq!(hdr.seq_num, initial_seq);
+                assert_eq!(hdr.ack_num, conn.recv_seq);
+                assert_eq!(payload, b"hello");
+            }
+            _ => panic!("expected TcpAction::Send"),
+        }
+    }
+
+    #[test]
+    fn test_recv_data_delivers_and_acks() {
+        let mut conn = established_conn();
+        let initial_recv_seq = conn.recv_seq;
+        let hdr = TcpHeader {
+            psh: true,
+            ack: true,
+            seq_num: initial_recv_seq,
+            ack_num: conn.send_seq,
+            src_port: 5555,
+            ..Default::default()
+        };
+        let actions = conn.handle(&hdr, b"world");
+        assert_eq!(conn.recv_seq, initial_recv_seq + 5, "recv_seq should advance by payload len");
+        let has_deliver = actions.iter().any(|a| matches!(a, TcpAction::Deliver(d) if d == b"world"));
+        let has_ack = actions.iter().any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
+        assert!(has_deliver, "should deliver data");
+        assert!(has_ack, "should send ACK");
+    }
+
+    #[test]
+    fn test_send_data_not_established() {
+        let mut conn = TcpConnection::new_listener("10.0.0.1:4444".parse().unwrap());
+        let actions = conn.send_data(b"hello");
+        assert!(actions.is_empty(), "send_data should do nothing when not Established");
     }
 
     #[test]
