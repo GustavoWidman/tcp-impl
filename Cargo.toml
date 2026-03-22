@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tun = { version = "0.6", features = ["async"] }
+tun = "0.6"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"

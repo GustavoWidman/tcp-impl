@@ -5,7 +5,7 @@ use std::{
 
 use crate::common::checksum::rfc1071_checksum;
 use crate::common::traits::{FromBytes, ToBytes};
-use crate::proto::headers::{pseudo::TcpPseudoHeader, tcp::TcpHeader};
+use crate::proto::headers::{ipv4::Ipv4Header, pseudo::TcpPseudoHeader, tcp::TcpHeader};
 
 pub struct TcpSegment {
     pub header: TcpHeader,
@@ -62,6 +62,26 @@ impl FromBytes for TcpSegment {
         }
         let header = TcpHeader::from_bytes(&bytes[..20])?;
         let payload = bytes[20..].to_vec();
+        Ok(Self { header, payload })
+    }
+}
+
+pub struct Ipv4Packet {
+    pub header: Ipv4Header,
+    pub payload: Vec<u8>,
+}
+
+impl FromBytes for Ipv4Packet {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let header = Ipv4Header::from_bytes(bytes)?;
+        let offset = header.payload_offset();
+        if bytes.len() < offset {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "packet too short for IPv4 payload",
+            ));
+        }
+        let payload = bytes[offset..].to_vec();
         Ok(Self { header, payload })
     }
 }
