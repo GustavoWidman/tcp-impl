@@ -27,8 +27,24 @@ fn main() -> std::io::Result<()> {
             log::info!("connection closed");
         }
         cli::Command::Sender { tun_ip, connect } => {
-            log::info!("sender mode — tun-ip={} connect={}", tun_ip, connect);
-            log::warn!("sender mode not yet implemented");
+            let mut tun = proto::tun::TunDevice::new(&tun_ip.to_string())?;
+            let local_addr: std::net::SocketAddrV4 =
+                format!("{}:{}", tun_ip, 54321u16).parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid local addr: {e}"),
+                    )
+                })?;
+            let (mut conn, syn_hdr) =
+                proto::connection::TcpConnection::new_connector(local_addr, connect);
+            proto::connector::connect(&mut tun, &mut conn, syn_hdr)?;
+            log::info!(
+                "connection established with {}",
+                conn.remote_addr
+                    .expect("connect guarantees remote_addr is set")
+            );
+            conn.run(tun)?;
+            log::info!("connection closed");
         }
     }
 

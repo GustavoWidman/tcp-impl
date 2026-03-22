@@ -10,7 +10,6 @@ use crate::proto::tun::TunDevice;
 pub enum TcpState {
     Closed,
     Listen,
-    #[allow(dead_code)] // active open (sender mode) not yet implemented
     SynSent,
     SynReceived,
     Established,
@@ -59,6 +58,21 @@ impl TcpConnection {
         }
     }
 
+    /// Create a connection in SynSent state for active open. Returns the connection
+    /// and the initial SYN header that the caller must send.
+    pub fn new_connector(local: SocketAddrV4, remote: SocketAddrV4) -> (Self, TcpHeader) {
+        let isn = Self::derive_isn(local.port());
+        let conn = Self {
+            state: TcpState::SynSent,
+            local_addr: local,
+            remote_addr: Some(remote),
+            send_seq: isn.wrapping_add(1), // SYN consumes one sequence number
+            recv_seq: 0,
+        };
+        let hdr = TcpHeader::syn(local.port(), remote.port(), isn);
+        (conn, hdr)
+    }
+
     pub fn handle(&mut self, seg: &TcpHeader, payload: &[u8]) -> Vec<TcpAction> {
         // Rule 1: RST in any state → Closed
         if seg.rst {
@@ -78,6 +92,14 @@ impl TcpConnection {
                 self.state = TcpState::SynReceived;
                 let hdr = TcpHeader::syn_ack(local_port, remote_port, isn, self.recv_seq);
                 vec![TcpAction::Send(hdr, vec![])]
+            }
+
+            // SynSent + SYN-ACK (ack_num matches our send_seq) → Established, send ACK
+            TcpState::SynSent if seg.syn && seg.ack && seg.ack_num == self.send_seq => {
+                self.recv_seq = seg.seq_num.wrapping_add(1);
+                self.state = TcpState::Established;
+                let ack_hdr = TcpHeader::ack(local_port, remote_port, self.send_seq, self.recv_seq);
+                vec![TcpAction::Send(ack_hdr, vec![])]
             }
 
             // Rule 3: SynReceived + ACK (ack_num matches send_seq)
@@ -557,6 +579,79 @@ mod tests {
             actions.is_empty(),
             "send_data should do nothing when not Established"
         );
+    }
+
+    #[test]
+    fn test_connector_new() {
+        let local: SocketAddrV4 = "10.0.0.2:54321".parse().unwrap();
+        let remote: SocketAddrV4 = "10.0.0.1:4444".parse().unwrap();
+        let (conn, syn_hdr) = TcpConnection::new_connector(local, remote);
+        assert_eq!(conn.state, TcpState::SynSent);
+        assert_eq!(conn.remote_addr, Some(remote));
+        assert!(syn_hdr.syn, "initial segment must be SYN");
+        assert!(!syn_hdr.ack, "initial SYN must not have ACK");
+        assert_eq!(syn_hdr.src_port, 54321);
+        assert_eq!(syn_hdr.dst_port, 4444);
+        // send_seq is ISN+1 because SYN consumed one sequence number
+        assert_eq!(conn.send_seq, syn_hdr.seq_num.wrapping_add(1));
+    }
+
+    #[test]
+    fn test_active_open_syn_ack() {
+        let local: SocketAddrV4 = "10.0.0.2:54321".parse().unwrap();
+        let remote: SocketAddrV4 = "10.0.0.1:4444".parse().unwrap();
+        let (mut conn, syn_hdr) = TcpConnection::new_connector(local, remote);
+
+        let server_isn = 9000u32;
+        // Server sends SYN-ACK acknowledging our SYN
+        let syn_ack = TcpHeader {
+            syn: true,
+            ack: true,
+            seq_num: server_isn,
+            ack_num: syn_hdr.seq_num.wrapping_add(1),
+            src_port: 4444,
+            dst_port: 54321,
+            ..Default::default()
+        };
+
+        let actions = conn.handle(&syn_ack, &[]);
+        assert_eq!(
+            conn.state,
+            TcpState::Established,
+            "SYN-ACK should move to Established"
+        );
+        assert_eq!(conn.recv_seq, server_isn.wrapping_add(1));
+
+        let has_ack = actions
+            .iter()
+            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack && !h.syn));
+        assert!(has_ack, "should send final ACK to complete handshake");
+    }
+
+    #[test]
+    fn test_active_open_wrong_ack_ignored() {
+        let local: SocketAddrV4 = "10.0.0.2:54321".parse().unwrap();
+        let remote: SocketAddrV4 = "10.0.0.1:4444".parse().unwrap();
+        let (mut conn, syn_hdr) = TcpConnection::new_connector(local, remote);
+
+        // SYN-ACK with wrong ack_num should not advance state
+        let bad_syn_ack = TcpHeader {
+            syn: true,
+            ack: true,
+            seq_num: 9000,
+            ack_num: syn_hdr.seq_num.wrapping_add(999), // wrong — not ISN+1
+            src_port: 4444,
+            dst_port: 54321,
+            ..Default::default()
+        };
+
+        let actions = conn.handle(&bad_syn_ack, &[]);
+        assert_eq!(
+            conn.state,
+            TcpState::SynSent,
+            "wrong ack_num must not advance state"
+        );
+        assert!(actions.is_empty(), "no response for unmatched SYN-ACK");
     }
 
     #[test]
