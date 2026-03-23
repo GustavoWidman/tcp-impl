@@ -1,5 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use colored::Colorize;
 
 use crate::common::traits::FromBytes;
 use crate::proto::headers::tcp::TcpHeader;
@@ -74,7 +78,7 @@ impl TcpConnection {
     }
 
     pub fn handle(&mut self, seg: &TcpHeader, payload: &[u8]) -> Vec<TcpAction> {
-        // Rule 1: RST in any state → Closed
+        // Rule 1: RST in any state -> Closed
         if seg.rst {
             self.state = TcpState::Closed;
             return vec![TcpAction::Close];
@@ -94,7 +98,7 @@ impl TcpConnection {
                 vec![TcpAction::Send(hdr, vec![])]
             }
 
-            // SynSent + SYN-ACK (ack_num matches our send_seq) → Established, send ACK
+            // SynSent + SYN-ACK (ack_num matches our send_seq) -> Established, send ACK
             TcpState::SynSent if seg.syn && seg.ack && seg.ack_num == self.send_seq => {
                 self.recv_seq = seg.seq_num.wrapping_add(1);
                 self.state = TcpState::Established;
@@ -155,7 +159,7 @@ impl TcpConnection {
                 vec![TcpAction::Close]
             }
 
-            // Rule 9: Closing + ACK → TimeWait → Closed (immediate, no 2*MSL)
+            // Rule 9: Closing + ACK -> TimeWait -> Closed (immediate, no 2*MSL)
             TcpState::Closing if seg.ack && seg.ack_num == self.send_seq => {
                 self.state = TcpState::Closed;
                 vec![TcpAction::Close]
@@ -209,16 +213,16 @@ impl TcpConnection {
         vec![TcpAction::Send(hdr, data.to_vec())]
     }
 
-    pub fn run(self, tun: TunDevice) -> std::io::Result<()> {
+    pub fn run(self, tun: TunDevice, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
         use std::io::{BufRead, Write};
-        use std::sync::{mpsc, Arc, Mutex};
+        use std::sync::{mpsc, Mutex};
 
         let conn = Arc::new(Mutex::new(self));
         let tun = Arc::new(Mutex::new(tun));
 
         let (out_tx, out_rx) = mpsc::channel::<(TcpHeader, Vec<u8>)>();
 
-        // Thread 2 (send): read stdin lines → call send_data → queue segments
+        // Thread 2 (send): read stdin lines -> call send_data -> queue segments
         let conn_send = Arc::clone(&conn);
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
@@ -252,16 +256,48 @@ impl TcpConnection {
                 let local_ip = *c.local_addr.ip();
                 let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
                 drop(c);
+                if hdr.psh {
+                    log::debug!(
+                        "{} sent PSH+ACK seq={} ack={} len={}",
+                        "->".green(),
+                        hdr.seq_num,
+                        hdr.ack_num,
+                        payload.len()
+                    );
+                } else if hdr.fin {
+                    log::debug!(
+                        "{} sent FIN+ACK seq={} ack={}",
+                        "->".green(),
+                        hdr.seq_num,
+                        hdr.ack_num
+                    );
+                }
                 let segment = TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
                 tun.lock()
                     .expect("mutex not poisoned")
                     .write_ip_packet(local_ip, remote_ip, &segment)?;
             }
 
-            // Blocking TUN read
+            // Check for shutdown signal (Ctrl+C)
+            if shutdown.load(Ordering::Relaxed) {
+                let mut c = conn.lock().expect("mutex not poisoned");
+                if let Some(TcpAction::Send(hdr, payload)) = c.close() {
+                    let local_ip = *c.local_addr.ip();
+                    let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
+                    drop(c);
+                    let segment =
+                        TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                    tun.lock()
+                        .expect("mutex not poisoned")
+                        .write_ip_packet(local_ip, remote_ip, &segment)?;
+                }
+                break;
+            }
+
+            // Non-blocking TUN read with timeout so we can drain the outgoing queue
             let pkt = {
                 let mut t = tun.lock().expect("mutex not poisoned");
-                t.read_ip_packet()?
+                t.read_ip_packet_timeout(Duration::from_millis(50))?
             };
             let pkt = match pkt {
                 Some(p) => p,
@@ -292,6 +328,30 @@ impl TcpConnection {
                 }
             }
 
+            // Log incoming packet at DEBUG level (after filter — don't log spurious packets)
+            {
+                let hdr_len = seg_hdr.header_len().max(20);
+                let payload_len = pkt.payload.len().saturating_sub(hdr_len);
+                if seg_hdr.fin {
+                    log::debug!("{} recv FIN seq={}", "<-".cyan(), seg_hdr.seq_num);
+                } else if seg_hdr.psh || payload_len > 0 {
+                    log::debug!(
+                        "{} recv PSH+ACK seq={} ack={} len={}",
+                        "<-".cyan(),
+                        seg_hdr.seq_num,
+                        seg_hdr.ack_num,
+                        payload_len
+                    );
+                } else if seg_hdr.ack {
+                    log::debug!(
+                        "{} recv ACK seq={} ack={}",
+                        "<-".cyan(),
+                        seg_hdr.seq_num,
+                        seg_hdr.ack_num
+                    );
+                }
+            }
+
             let hdr_len = seg_hdr.header_len().max(20);
             let tcp_payload = if pkt.payload.len() > hdr_len {
                 pkt.payload[hdr_len..].to_vec()
@@ -313,6 +373,21 @@ impl TcpConnection {
             for action in actions {
                 match action {
                     TcpAction::Send(hdr, payload) => {
+                        if hdr.fin {
+                            log::debug!(
+                                "{} sent FIN+ACK seq={} ack={}",
+                                "->".green(),
+                                hdr.seq_num,
+                                hdr.ack_num
+                            );
+                        } else if hdr.ack {
+                            log::debug!(
+                                "{} sent ACK seq={} ack={}",
+                                "->".green(),
+                                hdr.seq_num,
+                                hdr.ack_num
+                            );
+                        }
                         let segment =
                             TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
                         tun.lock()
@@ -332,6 +407,28 @@ impl TcpConnection {
 
             if should_close {
                 break;
+            }
+
+            // If remote closed first, complete our half of the close immediately.
+            let state = conn.lock().expect("mutex not poisoned").state.clone();
+            if state == TcpState::CloseWait {
+                let mut c = conn.lock().expect("mutex not poisoned");
+                if let Some(TcpAction::Send(hdr, payload)) = c.close() {
+                    let remote_ip = c.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
+                    log::debug!(
+                        "{} sent FIN+ACK seq={} ack={}",
+                        "->".green(),
+                        hdr.seq_num,
+                        hdr.ack_num
+                    );
+                    drop(c);
+                    let segment =
+                        TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                    tun.lock()
+                        .expect("mutex not poisoned")
+                        .write_ip_packet(local_ip, remote_ip, &segment)?;
+                }
+                // Wait for the final ACK of our FIN before exiting
             }
         }
 
@@ -550,12 +647,12 @@ mod tests {
     fn test_simultaneous_close() {
         let mut conn = established_conn();
 
-        // We initiate close → FinWait1
+        // We initiate close -> FinWait1
         let close_action = conn.close().expect("close should return action");
         assert_eq!(conn.state, TcpState::FinWait1);
         assert!(matches!(close_action, TcpAction::Send(h, _) if h.fin));
 
-        // Remote sends FIN before ACKing ours → Closing
+        // Remote sends FIN before ACKing ours -> Closing
         // ack_num = 999 does not match conn.send_seq (1001), so Rule 6 doesn't fire
         let fin = fin_ack_seg(conn.recv_seq, 999);
         let actions = conn.handle(&fin, &[]);
@@ -564,7 +661,7 @@ mod tests {
             .iter()
             .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack)));
 
-        // Remote ACKs our FIN → Closed
+        // Remote ACKs our FIN -> Closed
         let ack = ack_seg(conn.recv_seq, conn.send_seq);
         let actions = conn.handle(&ack, &[]);
         assert_eq!(conn.state, TcpState::Closed);

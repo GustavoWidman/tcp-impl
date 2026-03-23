@@ -1,4 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use colored::Colorize;
 
@@ -28,7 +31,7 @@ impl TcpListener {
         self.tun
     }
 
-    pub fn accept(&mut self) -> std::io::Result<TcpConnection> {
+    pub fn accept(&mut self, shutdown: Arc<AtomicBool>) -> std::io::Result<TcpConnection> {
         log::info!("listening on {}:{}", self.local_ip, self.port);
 
         let local_addr: SocketAddrV4 =
@@ -44,7 +47,14 @@ impl TcpListener {
         let mut conn = TcpConnection::new_listener(local_addr);
 
         loop {
-            let pkt = match self.tun.read_ip_packet()? {
+            if shutdown.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "shutdown",
+                ));
+            }
+
+            let pkt = match self.tun.read_ip_packet_timeout(Duration::from_millis(50))? {
                 Some(p) => p,
                 None => continue,
             };
@@ -85,10 +95,10 @@ impl TcpListener {
             // Log incoming segment
             match &conn.state {
                 TcpState::Listen if seg_hdr.syn && !seg_hdr.ack => {
-                    log::debug!("recv SYN seq={}", seg_hdr.seq_num);
+                    log::debug!("{} recv SYN seq={}", "<-".cyan(), seg_hdr.seq_num);
                 }
                 TcpState::SynReceived if seg_hdr.ack => {
-                    log::debug!("recv ACK — connection established");
+                    log::debug!("{} recv ACK — connection established", "<-".cyan());
                 }
                 _ => {}
             }
@@ -99,7 +109,12 @@ impl TcpListener {
                 match action {
                     TcpAction::Send(hdr, payload) => {
                         if hdr.syn && hdr.ack {
-                            log::debug!("sent SYN-ACK seq={} ack={}", hdr.seq_num, hdr.ack_num);
+                            log::debug!(
+                                "{} sent SYN-ACK seq={} ack={}",
+                                "->".green(),
+                                hdr.seq_num,
+                                hdr.ack_num
+                            );
                             log::info!(
                                 "connection from {}",
                                 format!("{}:{}", remote_ip, remote_port).blue()
@@ -135,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_handshake_segment_sequence() {
-        // SYN from 10.0.0.2:54321 → 10.0.0.1:4444, seq=100
+        // SYN from 10.0.0.2:54321 -> 10.0.0.1:4444, seq=100
         let mut conn = TcpConnection::new_listener("10.0.0.1:4444".parse().unwrap());
         let syn_hdr = TcpHeader {
             src_port: 54321,

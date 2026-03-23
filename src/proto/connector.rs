@@ -32,7 +32,7 @@ pub fn connect(
     let isn = syn_hdr.seq_num;
     let segment = TcpSegment::new(syn_hdr, vec![]).with_checksum(&local_ip, &remote_ip)?;
     tun.write_ip_packet(local_ip, remote_ip, &segment)?;
-    log::debug!("sent SYN seq={}", isn);
+    log::debug!("{} sent SYN seq={}", "->".green(), isn);
 
     // Wait for SYN-ACK and complete the handshake
     loop {
@@ -75,7 +75,8 @@ pub fn connect(
 
         if seg_hdr.syn && seg_hdr.ack {
             log::debug!(
-                "recv SYN-ACK seq={} ack={}",
+                "{} recv SYN-ACK seq={} ack={}",
+                "<-".cyan(),
                 seg_hdr.seq_num,
                 seg_hdr.ack_num
             );
@@ -87,7 +88,12 @@ pub fn connect(
             match action {
                 TcpAction::Send(hdr, payload) => {
                     if hdr.ack && !hdr.syn {
-                        log::debug!("sent ACK seq={} ack={}", hdr.seq_num, hdr.ack_num);
+                        log::debug!(
+                            "{} sent ACK seq={} ack={}",
+                            "->".green(),
+                            hdr.seq_num,
+                            hdr.ack_num
+                        );
                     }
                     let segment =
                         TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
