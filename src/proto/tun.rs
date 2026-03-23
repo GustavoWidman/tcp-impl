@@ -256,7 +256,11 @@ mod tests {
         frame.extend_from_slice(&MACOS_AF_INET_PREFIX);
         frame.extend_from_slice(&ip_bytes);
 
-        assert_eq!(&frame[..4], &[0x00, 0x00, 0x00, 0x02], "macOS frame must begin with AF_INET prefix");
+        assert_eq!(
+            &frame[..4],
+            &[0x00, 0x00, 0x00, 0x02],
+            "macOS frame must begin with AF_INET prefix"
+        );
 
         let parsed = Ipv4Packet::from_bytes(&frame[4..]).unwrap();
         assert_eq!(parsed.header.src_addr, [10, 0, 0, 1]);
@@ -343,7 +347,11 @@ mod tests {
         expected.extend_from_slice(&ip_header_bytes);
         expected.extend_from_slice(&segment_bytes);
 
-        assert_eq!(&expected[..4], &[0x00, 0x00, 0x00, 0x02], "write frame must begin with AF_INET prefix");
+        assert_eq!(
+            &expected[..4],
+            &[0x00, 0x00, 0x00, 0x02],
+            "write frame must begin with AF_INET prefix"
+        );
         assert_eq!(expected[4], 0x45, "IPv4 header must follow the AF prefix");
         assert_eq!(&expected[16..20], &[10, 0, 0, 1]);
         assert_eq!(&expected[20..24], &[10, 0, 0, 2]);

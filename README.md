@@ -1,6 +1,6 @@
 # tcp-impl
 
-![rust](https://img.shields.io/badge/rust-2021-orange?logo=rust)
+![rust](https://img.shields.io/badge/rust-2024-orange?logo=rust)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 a from-scratch TCP implementation over a TUN interface, in rust.
@@ -18,7 +18,7 @@ because sometimes relying on the OS's TCP stack just isn't fun enough.
 
 ## prerequisites
 
-- rust toolchain (2021 edition)
+- rust toolchain (2024 edition)
 - root/administrator privileges (the TUN device won't open without it)
 - macOS or Linux
 
@@ -42,12 +42,11 @@ start the listener, then connect with netcat from another terminal:
 # terminal 1
 sudo ./target/release/tcp-impl listener --tun-ip 10.0.0.1 --port 4444
 
-# terminal 2 (macOS)
+# terminal 2 (macOS / netcat-openbsd)
 nc 10.0.0.1 4444
 
-# terminal 2 (linux — force IPv4, GNU nc defaults to IPv6)
-nc -l -p 4444 -s 0.0.0.0
-# or: nc -4 10.0.0.1 4444  (ncat/netcat-openbsd)
+# terminal 2 (linux — GNU nc 0.7.1, no -4 flag)
+nc -s 0.0.0.0 10.0.0.1 4444
 ```
 
 type lines in either terminal. they flow through the hand-rolled TCP stack. after the connection closes, the listener automatically re-accepts the next one.
