@@ -112,4 +112,4 @@ at `debug` you see every segment:
 
 ## license
 
-MIT.
+[MIT](LICENSE)
