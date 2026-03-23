@@ -5,6 +5,8 @@
 
 a from-scratch TCP implementation over a TUN interface, in rust.
 
+> **want the full story on how i built this?** check out my blog post: [https://blog.guswid.com/tcp-impl](https://blog.guswid.com/tcp-impl)
+
 because sometimes relying on the OS's TCP stack just isn't fun enough.
 
 ## features
