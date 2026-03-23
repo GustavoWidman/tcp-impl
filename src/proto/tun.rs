@@ -46,10 +46,8 @@ impl TunDevice {
     /// kernel stack.
     ///
     /// On Linux, packet information (PI) headers are disabled so frames are raw IP
-    /// with no prefix. On macOS, the mandatory 4-byte AF family prefix is handled
-    /// in `read_ip_packet` and `write_ip_packet`.
-    /// with no prefix. On macOS, tun 0.6 does not strip the 4-byte AF family prefix
-    /// internally — userspace must handle it manually.
+    /// with no prefix. On macOS, tun 0.6 does not strip the 4-byte AF_INET prefix
+    /// internally — userspace must handle it in `read_ip_packet` / `write_ip_packet`.
     pub fn new(tun_ip: &str) -> std::io::Result<Self> {
         let peer: Ipv4Addr = tun_ip.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}"))
@@ -67,11 +65,6 @@ impl TunDevice {
             .up();
 
         // On Linux, disable packet information so frames are raw IP (no 4-byte PI header).
-        #[cfg(target_os = "linux")]
-        config.platform(|p| {
-            p.packet_information(false);
-        });
-
         #[cfg(target_os = "linux")]
         config.platform(|p| {
             p.packet_information(false);
@@ -95,18 +88,13 @@ impl TunDevice {
 
     /// Read one IPv4 packet from the TUN device.
     ///
-    /// On macOS (utun), every frame carries a mandatory 4-byte AF family prefix.
-    /// This method strips it and returns `None` if the prefix is not `AF_INET`.
-    ///
-    /// On Linux (tun, PI disabled), frames are raw IP with no prefix; the packet
-    /// is parsed directly. Returns `None` if it is not a valid IPv4 packet.
     /// On macOS (utun), tun 0.6 does NOT strip the mandatory 4-byte AF family
     /// prefix: `read()` returns `[0x00, 0x00, 0x00, 0x02] + <IP bytes>`. We
-    /// check for the prefix and parse `buf[4..n]` as the IPv4 packet. Frames
-    /// that do not carry the AF_INET prefix (e.g. IPv6) return `Ok(None)`.
+    /// check for the prefix and parse `buf[4..n]`. Non-AF_INET frames (e.g.
+    /// IPv6) return `Ok(None)`.
     ///
     /// On Linux (tun, PI disabled), frames are raw IP with no prefix and are
-    /// parsed directly.
+    /// parsed directly. Non-IPv4 frames (e.g. IPv6 link-local) return `Ok(None)`.
     pub fn read_ip_packet(&mut self) -> std::io::Result<Option<Ipv4Packet>> {
         #[cfg(target_os = "macos")]
         {
@@ -125,27 +113,7 @@ impl TunDevice {
             match Ipv4Packet::from_bytes(ip_bytes) {
                 Ok(pkt) => Ok(Some(pkt)),
                 Err(e) => {
-                    log::warn!("failed to parse IPv4 packet: {e}");
-                    Ok(None)
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        #[cfg(target_os = "macos")]
-        {
-            let mut buf = vec![0u8; 4 + self.mtu];
-            let n = self.inner.read(&mut buf)?;
-
-            if n < 4 || buf[..4] != MACOS_AF_INET_PREFIX {
-                // Not an IPv4 frame (could be IPv6 or other AF family)
-                return Ok(None);
-            }
-
-            match Ipv4Packet::from_bytes(&buf[4..n]) {
-                Ok(pkt) => Ok(Some(pkt)),
-                Err(e) => {
-                    log::warn!("failed to parse IPv4 packet: {e}");
+                    log::debug!("skipping non-IPv4 frame: {e}");
                     Ok(None)
                 }
             }
@@ -159,7 +127,7 @@ impl TunDevice {
             match Ipv4Packet::from_bytes(&buf[..n]) {
                 Ok(pkt) => Ok(Some(pkt)),
                 Err(e) => {
-                    log::warn!("failed to parse IPv4 packet: {e}");
+                    log::debug!("skipping non-IPv4 frame: {e}");
                     Ok(None)
                 }
             }
@@ -205,9 +173,6 @@ impl TunDevice {
 
     /// Write a TCP segment wrapped in an IPv4 packet to the TUN device.
     ///
-    /// On macOS (utun), prepends the mandatory 4-byte AF_INET prefix before writing.
-    ///
-    /// On Linux (tun, PI disabled), writes the raw IP frame with no prefix.
     /// On macOS (utun), tun 0.6 does NOT prepend the 4-byte AF_INET prefix
     /// internally — userspace must build the full frame as
     /// `[0x00, 0x00, 0x00, 0x02] + <IPv4 header> + <TCP segment>`.
@@ -245,20 +210,6 @@ impl TunDevice {
 
         #[cfg(target_os = "linux")]
         {
-            // Write raw IP frame — no prefix when PI is disabled
-        #[cfg(target_os = "macos")]
-        {
-            // Prepend the 4-byte AF_INET prefix manually (tun 0.6 does not do this).
-            let mut frame =
-                Vec::with_capacity(4 + ip_header_bytes.len() + segment_bytes.len());
-            frame.extend_from_slice(&MACOS_AF_INET_PREFIX);
-            frame.extend_from_slice(&ip_header_bytes);
-            frame.extend_from_slice(&segment_bytes);
-            self.inner.write_all(&frame)?;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
             // No prefix on Linux with PI disabled.
             let mut frame = Vec::with_capacity(ip_header_bytes.len() + segment_bytes.len());
             frame.extend_from_slice(&ip_header_bytes);
@@ -280,9 +231,6 @@ mod tests {
     use super::*;
     use crate::proto::headers::tcp::TcpHeader;
 
-    /// Test that the 4-byte prefix stripping works correctly on macOS.
-    /// We construct a fake frame with [0,0,0,2] prefix + known IPv4 bytes
-    /// and verify from_bytes parses it.
     /// Test that macOS TUN frames carry the 4-byte AF_INET prefix.
     ///
     /// tun 0.6 does NOT strip the prefix on read — userspace must check for
@@ -303,26 +251,13 @@ mod tests {
         // Append 20 bytes of dummy TCP payload to make total_length match
         ip_bytes.extend_from_slice(&[0u8; 20]);
 
-        // Simulate a macOS TUN frame: prefix + ip packet
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&MACOS_AF_INET_PREFIX);
-        frame.extend_from_slice(&ip_bytes);
         // Simulate what the kernel delivers on macOS: 4-byte AF_INET prefix + IP bytes.
         let mut frame = Vec::new();
         frame.extend_from_slice(&MACOS_AF_INET_PREFIX);
         frame.extend_from_slice(&ip_bytes);
 
-        // Verify the prefix is exactly [0x00, 0x00, 0x00, 0x02]
-        assert_eq!(
-            &frame[..4],
-            &[0x00, 0x00, 0x00, 0x02],
-            "macOS frame must begin with AF_INET prefix [0,0,0,2]"
-        );
+        assert_eq!(&frame[..4], &[0x00, 0x00, 0x00, 0x02], "macOS frame must begin with AF_INET prefix");
 
-        // Now test the parsing logic (same as what read_ip_packet does internally)
-        assert_eq!(&frame[..4], &MACOS_AF_INET_PREFIX);
-        let parsed = Ipv4Packet::from_bytes(&frame[4..]).unwrap();
-        // Strip prefix and parse the IPv4 packet
         let parsed = Ipv4Packet::from_bytes(&frame[4..]).unwrap();
         assert_eq!(parsed.header.src_addr, [10, 0, 0, 1]);
         assert_eq!(parsed.header.dst_addr, [10, 0, 0, 2]);
@@ -382,8 +317,6 @@ mod tests {
     }
 
     /// Test the write frame construction on macOS: verify the output starts with
-    /// [0,0,0,2] followed by a valid IPv4 header.
-    /// Test the write frame construction on macOS: verify the output starts with
     /// the 4-byte AF_INET prefix `[0x00, 0x00, 0x00, 0x02]` followed by the IPv4
     /// header. tun 0.6 does not add this prefix — userspace must supply it.
     #[cfg(target_os = "macos")]
@@ -404,36 +337,16 @@ mod tests {
         let ip_header = Ipv4Header::new(total_length, 0, 64, 6, src.octets(), dst.octets());
         let ip_header_bytes = ip_header.to_bytes().unwrap();
 
-        // Build expected frame
         // Build expected frame: AF_INET prefix + IPv4 header + TCP segment
         let mut expected = Vec::new();
         expected.extend_from_slice(&MACOS_AF_INET_PREFIX);
         expected.extend_from_slice(&ip_header_bytes);
         expected.extend_from_slice(&segment_bytes);
 
-        // Verify prefix
-        assert_eq!(&expected[..4], &[0x00, 0x00, 0x00, 0x02]);
-        // First 4 bytes must be the AF_INET prefix
-        assert_eq!(
-            &expected[..4],
-            &[0x00, 0x00, 0x00, 0x02],
-            "write frame must begin with AF_INET prefix [0,0,0,2]"
-        );
-
-        // Verify IPv4 header bytes 12..16 = src IP and 16..20 = dst IP
-        assert_eq!(&expected[16..20], &[10, 0, 0, 1]);
-        assert_eq!(&expected[20..24], &[10, 0, 0, 2]);
-
-        // Verify protocol = TCP (6) at byte 13 of the IP header (= offset 4+9 = 13)
-        assert_eq!(expected[4 + 9], 6);
-        // IPv4 version/IHL byte at offset 4
+        assert_eq!(&expected[..4], &[0x00, 0x00, 0x00, 0x02], "write frame must begin with AF_INET prefix");
         assert_eq!(expected[4], 0x45, "IPv4 header must follow the AF prefix");
-
-        // src IP at bytes 16..20, dst IP at bytes 20..24 (offset by 4 for prefix)
         assert_eq!(&expected[16..20], &[10, 0, 0, 1]);
         assert_eq!(&expected[20..24], &[10, 0, 0, 2]);
-
-        // Protocol = TCP (6) at byte 13 (offset by 4 for prefix)
         assert_eq!(expected[13], 6);
     }
 
