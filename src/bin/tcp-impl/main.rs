@@ -1,16 +1,13 @@
 mod cli;
-mod common;
-mod proto;
-mod utils;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 
 fn main() -> std::io::Result<()> {
     let args = cli::Args::parse();
-    utils::log::Logger::init(&args);
+    tcp_impl::utils::log::Logger::init(args.verbosity);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown);
@@ -22,11 +19,11 @@ fn main() -> std::io::Result<()> {
 
     match args.command {
         cli::Command::Listener { tun_ip, port } => {
-            let tun = proto::tun::TunDevice::new(&tun_ip.to_string())?;
+            let tun = tcp_impl::TunDevice::new(&tun_ip.to_string())?;
             log::info!("listening on {}:{}", tun_ip, port);
             log::info!("run: nc {} {}", tun_ip, port);
 
-            let mut listener = proto::listener::TcpListener::new(tun, tun_ip, port);
+            let mut listener = tcp_impl::TcpListener::new(tun, tun_ip, port);
             loop {
                 let conn = match listener.accept(Arc::clone(&shutdown)) {
                     Ok(c) => c,
@@ -45,13 +42,13 @@ fn main() -> std::io::Result<()> {
                     break;
                 }
                 // Reclaim the TUN device for the next accept
-                let tun = proto::tun::TunDevice::new(&tun_ip.to_string())?;
-                listener = proto::listener::TcpListener::new(tun, tun_ip, port);
+                let tun = tcp_impl::TunDevice::new(&tun_ip.to_string())?;
+                listener = tcp_impl::TcpListener::new(tun, tun_ip, port);
                 log::info!("waiting for new connection on {}:{}", tun_ip, port);
             }
         }
         cli::Command::Sender { tun_ip, connect } => {
-            let mut tun = proto::tun::TunDevice::new(&tun_ip.to_string())?;
+            let mut tun = tcp_impl::TunDevice::new(&tun_ip.to_string())?;
             let local_addr: std::net::SocketAddrV4 =
                 format!("{}:{}", tun_ip, 54321u16).parse().map_err(|e| {
                     std::io::Error::new(
@@ -59,9 +56,8 @@ fn main() -> std::io::Result<()> {
                         format!("invalid local addr: {e}"),
                     )
                 })?;
-            let (mut conn, syn_hdr) =
-                proto::connection::TcpConnection::new_connector(local_addr, connect);
-            proto::connector::connect(&mut tun, &mut conn, syn_hdr)?;
+            let (mut conn, syn_hdr) = tcp_impl::TcpConnection::new_connector(local_addr, connect);
+            tcp_impl::connector::connect(&mut tun, &mut conn, syn_hdr)?;
             log::info!(
                 "connection established with {}",
                 conn.remote_addr

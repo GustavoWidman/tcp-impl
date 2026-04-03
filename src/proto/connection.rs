@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use colored::Colorize;
@@ -213,9 +213,129 @@ impl TcpConnection {
         vec![TcpAction::Send(hdr, data.to_vec())]
     }
 
+    /// Read the next chunk of application data from the TCP connection.
+    ///
+    /// Polls the TUN device with a short timeout. If a TCP segment arrives,
+    /// processes it through the state machine and returns any delivered payload.
+    /// Returns `Ok(None)` if the timeout expires without data, or if the
+    /// connection has closed.
+    pub fn read(&mut self, tun: &mut TunDevice) -> std::io::Result<Option<Vec<u8>>> {
+        let pkt = match tun.read_ip_packet_timeout(Duration::from_millis(50))? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        if pkt.header.protocol != 6 {
+            return Ok(None);
+        }
+        if pkt.payload.len() < 20 {
+            return Ok(None);
+        }
+
+        let seg_hdr = match TcpHeader::from_bytes(&pkt.payload) {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+
+        let remote_ip = Ipv4Addr::from(pkt.header.src_addr);
+
+        // Filter: only packets from our established remote
+        if let Some(remote_addr) = self.remote_addr
+            && (*remote_addr.ip() != remote_ip || remote_addr.port() != seg_hdr.src_port)
+        {
+            return Ok(None);
+        }
+
+        let hdr_len = seg_hdr.header_len().max(20);
+        let tcp_payload = if pkt.payload.len() > hdr_len {
+            pkt.payload[hdr_len..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let local_ip = *self.local_addr.ip();
+
+        let actions = self.handle(&seg_hdr, &tcp_payload);
+
+        let mut delivered = None;
+        let mut should_close = false;
+
+        for action in actions {
+            match action {
+                TcpAction::Send(hdr, payload) => {
+                    if hdr.ack && !hdr.psh && !hdr.fin {
+                        log::debug!(
+                            "{} sent ACK seq={} ack={}",
+                            "->".green(),
+                            hdr.seq_num,
+                            hdr.ack_num
+                        );
+                    }
+                    let segment =
+                        TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                    tun.write_ip_packet(local_ip, remote_ip, &segment)?;
+                }
+                TcpAction::Deliver(data) => {
+                    delivered = Some(data);
+                }
+                TcpAction::Close | TcpAction::Reset => {
+                    should_close = true;
+                }
+            }
+        }
+
+        // If remote closed first, complete our half of the close.
+        if self.state == TcpState::CloseWait
+            && let Some(TcpAction::Send(hdr, payload)) = self.close()
+        {
+            let remote_ip = self.remote_addr.map(|a| *a.ip()).unwrap_or(local_ip);
+            log::debug!(
+                "{} sent FIN+ACK seq={} ack={}",
+                "->".green(),
+                hdr.seq_num,
+                hdr.ack_num
+            );
+            let segment = TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+            tun.write_ip_packet(local_ip, remote_ip, &segment)?;
+        }
+
+        if should_close {
+            return Ok(None);
+        }
+
+        Ok(delivered)
+    }
+
+    /// Send application data through the TCP connection.
+    ///
+    /// Calls `send_data` to produce the PSH+ACK segment, then writes the
+    /// resulting segment to the TUN device.
+    pub fn write(&mut self, tun: &mut TunDevice, data: &[u8]) -> std::io::Result<()> {
+        let local_ip = *self.local_addr.ip();
+        let remote_ip = self.remote_addr.map(|a| *a.ip()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "no remote addr")
+        })?;
+
+        for action in self.send_data(data) {
+            if let TcpAction::Send(hdr, payload) = action {
+                log::debug!(
+                    "{} sent PSH+ACK seq={} ack={} len={}",
+                    "->".green(),
+                    hdr.seq_num,
+                    hdr.ack_num,
+                    payload.len()
+                );
+                let segment = TcpSegment::new(hdr, payload).with_checksum(&local_ip, &remote_ip)?;
+                tun.write_ip_packet(local_ip, remote_ip, &segment)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn run(self, tun: TunDevice, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
         use std::io::{BufRead, Write};
-        use std::sync::{mpsc, Mutex};
+        use std::sync::{Mutex, mpsc};
 
         let conn = Arc::new(Mutex::new(self));
         let tun = Arc::new(Mutex::new(tun));
@@ -321,10 +441,10 @@ impl TcpConnection {
             // Filter: only packets from our established remote
             {
                 let c = conn.lock().expect("mutex not poisoned");
-                if let Some(remote_addr) = c.remote_addr {
-                    if *remote_addr.ip() != remote_ip || remote_addr.port() != seg_hdr.src_port {
-                        continue;
-                    }
+                if let Some(remote_addr) = c.remote_addr
+                    && (*remote_addr.ip() != remote_ip || remote_addr.port() != seg_hdr.src_port)
+                {
+                    continue;
                 }
             }
 
@@ -657,9 +777,11 @@ mod tests {
         let fin = fin_ack_seg(conn.recv_seq, 999);
         let actions = conn.handle(&fin, &[]);
         assert_eq!(conn.state, TcpState::Closing);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack)));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TcpAction::Send(h, _) if h.ack))
+        );
 
         // Remote ACKs our FIN -> Closed
         let ack = ack_seg(conn.recv_seq, conn.send_seq);

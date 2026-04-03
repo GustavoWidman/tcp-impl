@@ -3,6 +3,14 @@ name = "tcp-impl"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tcp_impl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcp-impl"
+path = "src/bin/tcp-impl/main.rs"
+
 [dependencies]
 tun = "0.6"
 libc = "0.2"
